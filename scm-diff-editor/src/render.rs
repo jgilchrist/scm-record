@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use scm_record::helpers::make_binary_description;
-use scm_record::{ChangeType, File, FileMode, Section, SectionChangedLine};
+use scm_record::{ChangeType, File, FileMode, FileModeTransition, Section, SectionChangedLine};
 use tracing::warn;
 
 use super::{Error, FileContents, FileInfo, Filesystem};
@@ -44,8 +44,10 @@ pub fn create_file(
     {
         sections.push(Section::FileMode {
             is_checked: false,
-            before: left_file_mode,
-            after: right_file_mode,
+            mode_transition: FileModeTransition {
+                before: left_file_mode,
+                after: right_file_mode,
+            },
         });
     }
 
@@ -143,7 +145,6 @@ pub fn create_file(
             None
         },
         path: Cow::Owned(right_display_path),
-        file_mode: None, // TODO
         sections,
     })
 }
@@ -211,7 +212,6 @@ pub fn create_merge_file(
     Ok(File {
         old_path: Some(Cow::Owned(base_path)),
         path: Cow::Owned(output_path),
-        file_mode: None,
         sections,
     })
 }

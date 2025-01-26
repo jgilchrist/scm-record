@@ -1320,8 +1320,7 @@ impl<'state, 'input> Recorder<'state, 'input> {
                         }
                         Section::FileMode {
                             is_checked: _,
-                            before: _,
-                            after: _,
+                            mode_transition: _,
                         }
                         | Section::Binary { .. } => {
                             result.push(SelectionKey::Section(SectionKey {
@@ -3072,8 +3071,7 @@ impl Component for SectionView<'_> {
 
             Section::FileMode {
                 is_checked,
-                before,
-                after,
+                mode_transition,
             } => {
                 let is_focused = match selection {
                     Some(SectionSelection::SectionHeader) => true,
@@ -3095,7 +3093,10 @@ impl Component for SectionView<'_> {
                 };
                 let toggle_box_rect = viewport.draw_component(x, y, &toggle_box);
                 let x = x + toggle_box_rect.width.unwrap_isize() + 1;
-                let text = format!("File mode changed from {before} to {after}");
+                let text = format!(
+                    "File mode changed from {} to {}",
+                    mode_transition.before, mode_transition.after
+                );
                 viewport.draw_text(x, y, Span::styled(text, Style::default().fg(Color::Blue)));
                 if is_focused {
                     highlight_rect(
@@ -3565,7 +3566,6 @@ mod tests {
             files: vec![File {
                 old_path: None,
                 path: Cow::Borrowed(Path::new("foo/bar")),
-                file_mode: None,
                 sections: Default::default(),
             }],
         };

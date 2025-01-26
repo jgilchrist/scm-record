@@ -24,7 +24,9 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 use scm_record::helpers::CrosstermInput;
-use scm_record::{File, FileMode, RecordError, RecordState, Recorder, SelectedContents};
+use scm_record::{
+    File, FileMode, RecordError, RecordState, Recorder, SelectedContents, SelectedChanges,
+};
 
 /// Render a partial commit selector for use as a difftool or mergetool.
 ///
@@ -438,13 +440,42 @@ fn print_dry_run(write_root: &Path, state: RecordState) {
     } = state;
     for file in files {
         let file_path = write_root.join(file.path.clone());
-        let (selected_contents, _unselected_contents) = file.get_selected_contents();
-        match selected_contents {
-            SelectedContents::Absent => {
-                println!("Would delete file: {}", file_path.display())
+        let (selected_contents, _unselected_contents) = file.get_selected_changes();
+
+        let Some(SelectedChanges {
+            contents,
+            mode_transition,
+        }) = selected_contents
+        else {
+            println!("Would leave file unchanged: {}", file_path.display());
+            continue;
+        };
+
+        if let Some(mode_transition) = mode_transition {
+            if mode_transition.is_deletion() {
+                println!("Would delete file: {}", file_path.display());
+                continue;
             }
+
+            if mode_transition.is_creation() {
+                println!("Would create file: {}", file_path.display());
+                continue;
+            }
+
+            println!(
+                "Would change file mode from {} to {}: {}",
+                mode_transition.before,
+                mode_transition.after,
+                file_path.display()
+            );
+        }
+
+        match contents {
             SelectedContents::Unchanged => {
-                println!("Would leave file unchanged: {}", file_path.display())
+                println!(
+                    "Would leave file contents unchanged: {}",
+                    file_path.display()
+                )
             }
             SelectedContents::Binary {
                 old_description,
@@ -454,7 +485,7 @@ fn print_dry_run(write_root: &Path, state: RecordState) {
                 println!("  Old: {:?}", old_description);
                 println!("  New: {:?}", new_description);
             }
-            SelectedContents::Present { contents } => {
+            SelectedContents::Text { contents } => {
                 println!("Would update text file: {}", file_path.display());
                 for line in contents.lines() {
                     println!("  {line}");
@@ -481,30 +512,37 @@ pub fn apply_changes(
     }
     for file in files {
         let file_path = write_root.join(file.path.clone());
-        let (selected_contents, _unselected_contents) = file.get_selected_contents();
+        let (selected_contents, _unselected_contents) = file.get_selected_changes();
         match selected_contents {
-            SelectedContents::Absent => {
+            None => {
                 filesystem.remove_file(&file_path)?;
             }
-            SelectedContents::Unchanged => {
-                // Do nothing.
-            }
-            SelectedContents::Binary {
-                old_description: _,
-                new_description: _,
-            } => {
-                let new_path = file_path;
-                let old_path = match &file.old_path {
-                    Some(old_path) => old_path.clone(),
-                    None => Cow::Borrowed(new_path.as_path()),
-                };
-                filesystem.copy_file(&old_path, &new_path)?;
-            }
-            SelectedContents::Present { contents } => {
-                if let Some(parent_dir) = file_path.parent() {
-                    filesystem.create_dir_all(parent_dir)?;
+            Some(SelectedChanges {
+                contents,
+                mode_transition: _,
+            }) => {
+                match contents {
+                    SelectedContents::Unchanged => {
+                        // Do nothing.
+                    }
+                    SelectedContents::Binary {
+                        old_description: _,
+                        new_description: _,
+                    } => {
+                        let new_path = file_path;
+                        let old_path = match &file.old_path {
+                            Some(old_path) => old_path.clone(),
+                            None => Cow::Borrowed(new_path.as_path()),
+                        };
+                        filesystem.copy_file(&old_path, &new_path)?;
+                    }
+                    SelectedContents::Text { contents } => {
+                        if let Some(parent_dir) = file_path.parent() {
+                            filesystem.create_dir_all(parent_dir)?;
+                        }
+                        filesystem.write_file(&file_path, &contents)?;
+                    }
                 }
-                filesystem.write_file(&file_path, &contents)?;
             }
         }
     }
