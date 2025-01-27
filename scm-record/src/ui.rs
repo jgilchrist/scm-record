@@ -35,7 +35,7 @@ use crate::render::{
 };
 use crate::types::{ChangeType, Commit, RecordError, RecordState, Tristate};
 use crate::util::{IsizeExt, UsizeExt};
-use crate::{File, Section, SectionChangedLine};
+use crate::{File, FileModeTransition, Section, SectionChangedLine};
 
 const NUM_CONTEXT_LINES: usize = 3;
 
@@ -451,6 +451,12 @@ enum StateUpdate {
 enum CommitViewMode {
     Inline,
     Adjacent,
+}
+
+enum ToggleSideEffects {
+    ToggledModeChangeSection(SectionKey, FileModeTransition, bool),
+    ToggledChangedSection(SectionKey, bool),
+    ToggledChangedLine(LineKey, bool),
 }
 
 /// UI component to record the user's changes.
@@ -1807,8 +1813,8 @@ impl<'state, 'input> Recorder<'state, 'input> {
             return Ok(());
         }
 
-        match selection {
-            SelectionKey::None => {}
+        let side_effects = match selection {
+            SelectionKey::None => { None }
             SelectionKey::File(file_key) => {
                 let tristate = self.file_tristate(file_key)?;
                 let is_checked_new = match tristate {
@@ -1818,6 +1824,8 @@ impl<'state, 'input> Recorder<'state, 'input> {
                 self.visit_file(file_key, |file| {
                     file.set_checked(is_checked_new);
                 })?;
+
+                None
             }
             SelectionKey::Section(section_key) => {
                 let tristate = self.section_tristate(section_key)?;
@@ -1825,16 +1833,94 @@ impl<'state, 'input> Recorder<'state, 'input> {
                     Tristate::False => true,
                     Tristate::Partial | Tristate::True => false,
                 };
+
                 self.visit_section(section_key, |section| {
                     section.set_checked(is_checked_new);
-                })?;
+
+                    if let Section::FileMode { mode_transition, .. } = section {
+                        return Some(ToggleSideEffects::ToggledModeChangeSection(section_key, mode_transition.clone(), is_checked_new));
+                    }
+
+                    if let Section::Changed { .. } = section {
+                        return Some(ToggleSideEffects::ToggledChangedSection(section_key, is_checked_new));
+                    }
+
+                    None
+                })?
             }
             SelectionKey::Line(line_key) => {
                 self.visit_line(line_key, |line| {
                     line.is_checked = !line.is_checked;
-                })?;
+
+                    return Some(ToggleSideEffects::ToggledChangedLine(line_key, line.is_checked))
+                })?
             }
-        }
+        };
+
+        if let Some(side_effects) = side_effects {
+            match side_effects {
+                ToggleSideEffects::ToggledModeChangeSection(section_key, mode_transition, toggled_to) => {
+                    // If we check a deletion, all lines in the file must be deleted
+                    if toggled_to && mode_transition.is_deletion() {
+                        self.visit_file_for_section(section_key, |file| {
+                            for section in &mut file.sections {
+                                if matches!(section, Section::Changed {.. }) {
+                                    section.set_checked(true);
+                                }
+                            }
+                        })?;
+                    }
+
+                    // If we uncheck a creation, no lines in the file can be added
+                    if !toggled_to && mode_transition.is_creation() {
+                        self.visit_file_for_section(section_key, |file| {
+                            for section in &mut file.sections {
+                                section.set_checked(false);
+                            }
+                        })?;
+                    }
+                }
+                ToggleSideEffects::ToggledChangedSection(section_key, toggled_to) => {
+                    self.visit_file_for_section(section_key, |file| {
+                        for section in &mut file.sections {
+                            if let Section::FileMode { mode_transition, is_checked } = section {
+                                // If we removed a line and the file was being deleted, it can no longer
+                                // be deleted as it needs to contain that line
+                                if !toggled_to && mode_transition.is_deletion() {
+                                    *is_checked = false;
+                                }
+
+                                // If we added a line and the file was not being created, it must be created
+                                // in order to contain that line
+                                if toggled_to && mode_transition.is_creation() {
+                                    *is_checked = true;
+                                }
+                            }
+                        }
+                    })?;
+                }
+                ToggleSideEffects::ToggledChangedLine(line_key, toggled_to) => {
+                    self.visit_file_for_line(line_key, |file| {
+                        for section in &mut file.sections {
+                            if let Section::FileMode { mode_transition, is_checked } = section {
+                                // If we removed a line and the file was being deleted, it can no longer
+                                // be deleted as it needs to contain that line
+                                if !toggled_to && mode_transition.is_deletion() {
+                                    *is_checked = false;
+                                }
+
+                                // If we added a line and the file was not being created, it must be created
+                                // in order to contain that line
+                                if toggled_to && mode_transition.is_creation() {
+                                    *is_checked = true;
+                                }
+                            }
+                        }
+                    })?;
+                }
+            }
+        };
+
         Ok(())
     }
 
@@ -2054,6 +2140,45 @@ impl<'state, 'input> Recorder<'state, 'input> {
         }
     }
 
+    fn visit_file_for_section<T>(
+        &mut self,
+        section_key: SectionKey,
+        f: impl Fn(&mut File) -> T,
+    ) -> Result<T, RecordError> {
+        let SectionKey {
+            commit_idx: _,
+            file_idx,
+            section_idx: _,
+        } = section_key;
+
+        match self.state.files.get_mut(file_idx) {
+            Some(file) => Ok(f(file)),
+            None => Err(RecordError::Bug(format!(
+                "Out-of-bounds file key: {file_idx:?}"
+            ))),
+        }
+    }
+
+    fn visit_file_for_line<T>(
+        &mut self,
+        line_key: LineKey,
+        f: impl Fn(&mut File) -> T,
+    ) -> Result<T, RecordError> {
+        let LineKey {
+            commit_idx: _,
+            file_idx,
+            section_idx: _,
+            line_idx: _,
+        } = line_key;
+
+        match self.state.files.get_mut(file_idx) {
+            Some(file) => Ok(f(file)),
+            None => Err(RecordError::Bug(format!(
+                "Out-of-bounds file key: {file_idx:?}"
+            ))),
+        }
+    }
+
     fn visit_file<T>(
         &mut self,
         file_key: FileKey,
@@ -2146,11 +2271,11 @@ impl<'state, 'input> Recorder<'state, 'input> {
         Ok(section.tristate())
     }
 
-    fn visit_line(
+    fn visit_line<T>(
         &mut self,
         line_key: LineKey,
-        f: impl FnOnce(&mut SectionChangedLine),
-    ) -> Result<(), RecordError> {
+        f: impl FnOnce(&mut SectionChangedLine) -> Option<T>,
+    ) -> Result<Option<T>, RecordError> {
         let LineKey {
             commit_idx: _,
             file_idx,
@@ -2161,12 +2286,11 @@ impl<'state, 'input> Recorder<'state, 'input> {
         match section {
             Section::Changed { lines } => {
                 let line = &mut lines[line_idx];
-                f(line);
-                Ok(())
+                Ok(f(line))
             }
             Section::Unchanged { .. } | Section::FileMode { .. } | Section::Binary { .. } => {
                 // Do nothing.
-                Ok(())
+                Ok(None)
             }
         }
     }
